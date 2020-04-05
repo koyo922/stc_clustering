@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import os
+import subprocess
+
 from time import time
 
 import numpy as np
@@ -193,7 +195,27 @@ class STC(object):
         return y_pred
 
 
+def auto_device(forced_gpus: str = None, n_gpus: int = 1):
+    """ cuda不可用时，返回'cpu'; 否则，返回最空闲的那一张显卡，例如 'cuda:3' """
+    if forced_gpus is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = forced_gpus
+        return 'cuda:{}'.format(forced_gpus)
+    try:
+        lines = subprocess.check_output('nvidia-smi -q -d Memory |grep -A4 GPU|grep Free', shell=True).splitlines()
+        best_gpus_id = ','.join(str(g) for g in np.argsort([int(x.split()[2]) for x in lines])[-n_gpus:])
+        os.environ['CUDA_VISIBLE_DEVICES'] = best_gpus_id  # 注意启动的时候不要包括较满的卡 e.g. '4,5' 如果5是满的话
+        if tf.__version__ >= '2.0':  # tf1.x 需要使用 SessionConfig才能开启memory_growth，比较麻烦
+            gpus = tf.config.experimental.list_physical_devices(device_type='GPU')
+            for g in gpus:
+                tf.config.experimental.set_memory_growth(g, True)
+        return 'cuda:{}'.format(best_gpus_id)
+    except subprocess.CalledProcessError:
+        return 'cpu'
+
+
 if __name__ == "__main__":
+    auto_device(n_gpus=1)  # 只用一块显卡
+
     # args
     ####################################################################################
     import argparse

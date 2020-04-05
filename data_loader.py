@@ -38,6 +38,7 @@ def load_stackoverflow(data_path='data/stackoverflow/'):
 
     with open(data_path + 'title_StackOverflow.txt', 'r') as inp_txt:
         all_lines = inp_txt.readlines()[:-1]
+        nltk.download('punkt')
         text_file = " ".join([" ".join(nltk.word_tokenize(c)) for c in all_lines])
         word_count = Counter(text_file.split())
         total_count = sum(word_count.values())
