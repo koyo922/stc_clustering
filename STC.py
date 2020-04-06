@@ -146,29 +146,31 @@ class STC:
         # Step 1: initialize cluster centers using k-means
         logger.info('Initializing cluster centers with k-means.')
         km = KMeans(n_clusters=self.n_clusters, n_init=100)
-        centroids = km.fit_predict(self.encoder.predict(x))
-        y_pred_last = np.copy(centroids)  # TODO
+        centroids = km.fit_predict(self.encoder.predict(x))  # 聚类id不直接使用，仅用作收敛判断条件
         self.model.get_layer(name='clustering').set_weights([km.cluster_centers_])  # 直接用的是簇心位置
 
         loss = 0
         index = 0
+        last_centroids = centroids  # TODO
         index_array = np.arange(x.shape[0])
-        for ite in range(int(max_iter)):
-            if ite % update_interval == 0:
-                q = self.model.predict(x, verbose=0)
-                p = self.sharpen_distribution(q)
-                centroids = q.argmax(1)
-                acc = metrics.acc(y, centroids)
-                nmi = metrics.nmi(y, centroids)
-                logger.info('Iter %d: acc = %.5f, nmi = %.5f, loss = %.5f', ite, acc, nmi, loss)
+        for i in range(max_iter):
+            if i % update_interval == 0:  # 注意不能直接反写continue; 因为下面还有逻辑
+                q = self.model.predict(x, verbose=0)  # 软聚类结果
+                p = self.sharpen_distribution(q)  # 轻度锐化(差距拉得更开)结果
+                centroids = q.argmax(1)  # 重度锐化(硬聚类)结果
 
-                # check stop criterion
-                delta_label = np.sum(centroids != y_pred_last).astype(np.float32) / centroids.shape[0]
-                y_pred_last = np.copy(centroids)
-                if ite > 0 and delta_label < tol:
-                    print('delta_label ', delta_label, '< tol ', tol)
-                    print('Reached tolerance threshold. Stopping training.')
+                # 如果事先有人工标注的类别信息，可以用来打印精度；但是不参与模型训练
+                if y is not None:
+                    acc = metrics.acc(y, centroids)
+                    nmi = metrics.nmi(y, centroids)
+                    logger.info('Iter %d: acc = %.5f, nmi = %.5f, loss = %.5f', i, acc, nmi, loss)
+
+                # 如果硬聚类结果变动很小，就判定为收敛了，终止训练
+                diff_centroids_frac = np.mean(centroids != last_centroids)
+                if i > 0 and diff_centroids_frac < tol:
+                    logger.info('diff_centroids_frac(%.3f) < tol(%.3f), stop training', diff_centroids_frac, tol)
                     break
+                last_centroids = centroids
 
             idx = index_array[index * batch_size: min((index + 1) * batch_size, x.shape[0])]
             loss = self.model.train_on_batch(x=x[idx], y=p[idx])
@@ -246,7 +248,6 @@ if __name__ == "__main__":
     # clustering
     dec.model.summary()
     dec.model.compile(optimizer=SGD(0.1, 0.9), loss='kld')
-
     y_pred = dec.fit(X_trn, y_trn, tol=args.tol, max_iter=args.maxiter, batch_size=args.batch_size,
                      update_interval=args.update_interval, save_dir=args.save_dir)
     logger.info('acc: %.3f  nmi: %.3f', metrics.acc(y_trn, y_pred), metrics.nmi(y_trn, y_pred))
