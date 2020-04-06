@@ -11,7 +11,7 @@ import tensorflow as tf
 from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
 from tensorflow.python.keras.optimizers import SGD
-from tensorflow.python.keras.layers import Input, Dense, InputSpec
+from tensorflow.python.keras.layers import Input, Dense, InputSpec, Layer
 from tensorflow.python.keras.models import Model
 from tensorflow.python.keras import backend as K
 
@@ -75,7 +75,9 @@ def patch_tf_ops():
 patch_tf_ops()
 
 
-class ClusteringLayer(tf.keras.layers.Layer):
+class ClusteringLayer(Layer):
+    """ 内部维护各簇心; 对于各输入点，根据L2距离，求其软聚类id """
+
     def __init__(self, n_clusters, alpha=1.0, **kwargs):
         if 'input_shape' not in kwargs and 'input_dim' in kwargs:
             kwargs['input_shape'] = (kwargs.pop('input_dim'),)
@@ -107,15 +109,6 @@ class ClusteringLayer(tf.keras.layers.Layer):
         # shape: (q.T / q.sum()).T [B, 20] 每个样本的软聚类标签
         q = (q.T / q.sum(axis=1)).T
         return q
-
-    def compute_output_shape(self, input_shape):
-        assert input_shape and len(input_shape) == 2
-        return input_shape[0], self.n_clusters
-
-    def get_config(self):
-        config = {'n_clusters': self.n_clusters}
-        base_config = super(ClusteringLayer, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
 
 
 class STC:
