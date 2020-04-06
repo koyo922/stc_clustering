@@ -113,15 +113,9 @@ class ClusteringLayer(Layer):
 
 class STC:
     def __init__(self, dims, n_clusters, alpha=1.0, init='glorot_uniform'):
-        self.dims = dims
-        self.input_dim = dims[0]
-        self.n_stacks = len(self.dims) - 1
-
         self.n_clusters = n_clusters
-        self.alpha = alpha
-        self.ae, self.encoder = autoencoder(self.dims, init=init)
-
-        clustering_layer = ClusteringLayer(self.n_clusters, name='clustering')(self.encoder.output)
+        self.ae, self.encoder = autoencoder(dims, init=init)
+        clustering_layer = ClusteringLayer(self.n_clusters, alpha, name='clustering')(self.encoder.output)
         self.model = Model(inputs=self.encoder.input, outputs=clustering_layer)
 
     def pretrain(self, x, epochs=200, batch_size=256, save_dir='results/temp'):
