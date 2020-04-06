@@ -3,18 +3,21 @@
 import os
 import subprocess
 
+from rc_utils.misc.log_writer import init_log
+from rc_utils.misc.time import timing
 from time import time
 
 import numpy as np
 import tensorflow as tf
 from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
-from sklearn.utils import shuffle
 from tensorflow.python.keras.optimizers import SGD
+from tensorflow.python.keras.layers import Input, Dense
 
 import metrics
 from data_loader import load_data
 
+logger = init_log(__name__)
 
 def autoencoder(dims, act=tf.nn.leaky_relu, init='glorot_uniform'):
     n_stacks = len(dims) - 1
@@ -75,15 +78,8 @@ class ClusteringLayer(tf.keras.layers.Layer):
         return dict(list(base_config.items()) + list(config.items()))
 
 
-class STC(object):
-    def __init__(self,
-                 dims,
-                 n_clusters=20,
-                 alpha=1.0,
-                 init='glorot_uniform'):
-
-        super(STC, self).__init__()
-
+class STC:
+    def __init__(self, dims, n_clusters, alpha=1.0, init='glorot_uniform'):
         self.dims = dims
         self.input_dim = dims[0]
         self.n_stacks = len(self.dims) - 1
@@ -92,40 +88,15 @@ class STC(object):
         self.alpha = alpha
         self.autoencoder, self.encoder = autoencoder(self.dims, init=init)
 
-        # prepare DEC model
         clustering_layer = ClusteringLayer(self.n_clusters, name='clustering')(self.encoder.output)
         self.model = tf.keras.models.Model(inputs=self.encoder.input, outputs=clustering_layer)
 
-    def pretrain(self, x, y=None, optimizer='adam', epochs=200, batch_size=256, save_dir='results/temp'):
-        print('...Pretraining...')
-        self.autoencoder.compile(optimizer=optimizer, loss='mse')
-
-        if y is not None:
-            class PrintACC(tf.keras.callbacks.Callback):
-                def __init__(self, x, y):
-                    self.x = x
-                    self.y = y
-                    super(PrintACC, self).__init__()
-
-                def on_epoch_end(self, epoch, logs=None):
-                    if int(epochs / 10) != 0 and epoch % int(epochs / 10) != 0:
-                        return
-                    feature_model = tf.keras.models.Model(self.model.input,
-                                                          self.model.get_layer('encoder_3').output)
-                    features = feature_model.predict(self.x)
-                    km = KMeans(n_clusters=len(np.unique(self.y)), n_init=20, n_jobs=4)
-                    y_pred = km.fit_predict(features)
-                    # print()
-                    print(' ' * 8 + '|==>  acc: %.4f,  nmi: %.4f  <==|'
-                          % (metrics.acc(self.y, y_pred), metrics.nmi(self.y, y_pred)))
-
-        # begin pretraining
-        t0 = time()
-        self.autoencoder.fit(x, x, batch_size=batch_size, epochs=epochs)
-        print('Pretraining time: %ds' % round(time() - t0))
+    def pretrain(self, x, epochs=200, batch_size=256, save_dir='results/temp'):
+        self.autoencoder.compile(optimizer='adam', loss='mse')
+        with timing('pretraining', log_fn=logger.info):
+            self.autoencoder.fit(x, x, batch_size=batch_size, epochs=epochs)
         self.autoencoder.save_weights(save_dir + '/ae_weights.h5')
-        print('Pretrained weights are saved to %s/ae_weights.h5' % save_dir)
-        self.pretrained = True
+        logger.debug('Pretrained weights are saved to %s/ae_weights.h5', save_dir)
 
     def load_weights(self, weights):
         self.model.load_weights(weights)
@@ -147,17 +118,12 @@ class STC(object):
 
     def fit(self, x, y=None, maxiter=2e4, batch_size=256, tol=1e-3,
             update_interval=140, save_dir='./results/temp', rand_seed=None):
-
-        print('Update interval', update_interval)
-        save_interval = int(x.shape[0] / batch_size) * 5  # 5 epochs
-        print('Save interval', save_interval)
-
         # Step 1: initialize cluster centers using k-means
-        print('Initializing cluster centers with k-means.')
-        kmeans = KMeans(n_clusters=self.n_clusters, n_init=100)
-        y_pred = kmeans.fit_predict(self.encoder.predict(x))
-        y_pred_last = np.copy(y_pred)
-        self.model.get_layer(name='clustering').set_weights([kmeans.cluster_centers_])
+        logger.info('Initializing cluster centers with k-means.')
+        km = KMeans(n_clusters=self.n_clusters, n_init=100)
+        y_pred = km.fit_predict(self.encoder.predict(x))
+        y_pred_last = np.copy(y_pred)  # TODO
+        self.model.get_layer(name='clustering').set_weights([km.cluster_centers_])
 
         loss = 0
         index = 0
@@ -166,13 +132,10 @@ class STC(object):
             if ite % update_interval == 0:
                 q = self.model.predict(x, verbose=0)
                 p = self.target_distribution(q)
-
                 y_pred = q.argmax(1)
-                if y is not None:
-                    acc = np.round(metrics.acc(y, y_pred), 5)
-                    nmi = np.round(metrics.nmi(y, y_pred), 5)
-                    loss = np.round(loss, 5)
-                    print('Iter %d: acc = %.5f, nmi = %.5f' % (ite, acc, nmi), ' ; loss=', loss)
+                acc = metrics.acc(y, y_pred)
+                nmi = metrics.nmi(y, y_pred)
+                logger.info('Iter %d: acc = %.5f, nmi = %.5f, loss = %.5f', ite, acc, nmi, loss)
 
                 # check stop criterion
                 delta_label = np.sum(y_pred != y_pred_last).astype(np.float32) / y_pred.shape[0]
@@ -186,12 +149,8 @@ class STC(object):
             loss = self.model.train_on_batch(x=x[idx], y=p[idx])
             index = index + 1 if (index + 1) * batch_size <= x.shape[0] else 0
 
-            ite += 1
-
-        # save the trained model
-        print('saving model to:', save_dir + 'STC_model_final.h5')
-        self.model.save_weights(save_dir + 'STC_model_final.h5')
-
+        logger.info('saving model to: %s/STC_model_final.h5', save_dir)
+        self.model.save_weights(save_dir + '/STC_model_final.h5')
         return y_pred
 
 
@@ -213,30 +172,27 @@ def auto_device(forced_gpus: str = None, n_gpus: int = 1):
         return 'cpu'
 
 
-if __name__ == "__main__":
-    auto_device(n_gpus=1)  # 只用一块显卡
-
+def get_args():
     # args
-    ####################################################################################
     import argparse
-
     parser = argparse.ArgumentParser(description='train',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--dataset', default='stackoverflow',
                         choices=['stackoverflow', 'biomedical', 'search_snippets'])
-
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--maxiter', default=1000, type=int)
     parser.add_argument('--pretrain_epochs', default=15, type=int)
     parser.add_argument('--update_interval', default=30, type=int)
     parser.add_argument('--tol', default=0.0001, type=float)
     parser.add_argument('--ae_weights', default='/data/search_snippets/results/ae_weights.h5')
-    parser.add_argument('--save_dir', default='/data/search_snippets/results/')
-    args = parser.parse_args()
+    parser.add_argument('--save_dir', default='/data/search_snippets/results')
+    return parser.parse_args()
 
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
 
+if __name__ == "__main__":
+    auto_device(n_gpus=1)  # 只用一块显卡
+    args = get_args()
+    os.makedirs(args.save_dir, exist_ok=True)
     if args.dataset == 'search_snippets':
         args.update_interval = 100
         args.maxiter = 100
@@ -249,37 +205,25 @@ if __name__ == "__main__":
     else:
         raise Exception("Dataset not found!")
 
-    print(args)
-
     # load dataset
-    ####################################################################################
-    x, y = load_data(args.dataset)
-    n_clusters = len(np.unique(y))
-
-    X_test, X_dev, y_test, y_dev = train_test_split(x, y, test_size=0.1, random_state=0)
-    x, y = shuffle(X_test, y_test)
+    X_trn, X_tst, y_trn, y_tst = train_test_split(*load_data(args.dataset),
+                                                  test_size=0.1, random_state=0, shuffle=True)
 
     # create model
-    ####################################################################################
-    dec = STC(dims=[x.shape[-1], 500, 500, 2000, 20], n_clusters=n_clusters)
+    dec = STC(dims=[X_trn.shape[1], 500, 500, 2000, 20], n_clusters=np.unique(y_trn).size)
 
-    # pretrain model
-    ####################################################################################
-    if not os.path.exists(args.ae_weights):
-        dec.pretrain(x=x, y=y, optimizer='adam',
-                     epochs=args.pretrain_epochs, batch_size=args.batch_size,
-                     save_dir=args.save_dir)
-    else:
-        dec.autoencoder.load_weights(args.ae_weights)
+    # pretrain AutoEncoder-part
+    # if os.path.exists(args.ae_weights):
+    #     dec.autoencoder.load_weights(args.ae_weights)
+    # else:
+    #     dec.pretrain(X_trn, epochs=args.pretrain_epochs, batch_size=args.batch_size, save_dir=args.save_dir)
 
-    dec.model.summary()
-    t0 = time()
-    dec.compile(SGD(0.1, 0.9), loss='kld')
+    dec.autoencoder.load_weights(args.ae_weights)
+    # dec.pretrain(X_trn, epochs=args.pretrain_epochs, batch_size=args.batch_size, save_dir=args.save_dir)
 
     # clustering
-    ####################################################################################
-    y_pred = dec.fit(x, y=y, tol=args.tol, maxiter=args.maxiter, batch_size=args.batch_size,
-                     update_interval=args.update_interval, save_dir=args.save_dir,
-                     rand_seed=0)
-    print('acc:', metrics.acc(y, y_pred))
-    print('nmi', metrics.nmi(y, y_pred))
+    dec.model.summary()
+    dec.compile(optimizer=SGD(0.1, 0.9), loss='kld')
+    y_pred = dec.fit(X_trn, y_trn, tol=args.tol, maxiter=args.maxiter, batch_size=args.batch_size,
+                     update_interval=args.update_interval, save_dir=args.save_dir, rand_seed=0)
+    logger.info('acc: %.3f  nmi: %.3f', metrics.acc(y_trn, y_pred), metrics.nmi(y_trn, y_pred))
