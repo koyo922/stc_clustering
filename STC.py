@@ -5,7 +5,6 @@ import subprocess
 
 from rc_utils.misc.log_writer import init_log
 from rc_utils.misc.time import timing
-from time import time
 
 import numpy as np
 import tensorflow as tf
@@ -13,30 +12,29 @@ from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
 from tensorflow.python.keras.optimizers import SGD
 from tensorflow.python.keras.layers import Input, Dense
+from tensorflow.python.keras.models import Model
 
 import metrics
 from data_loader import load_data
 
 logger = init_log(__name__)
 
+
 def autoencoder(dims, act=tf.nn.leaky_relu, init='glorot_uniform'):
-    n_stacks = len(dims) - 1
-    # input
-    x = tf.keras.layers.Input(shape=(dims[0],), name='input')
-    h = x
+    # 编码部分 shape = [48(略), 500, 500, 2000, 20] 从48维的词向量空间 编码到 20维的聚类空间
+    h = x = Input(shape=(dims[0],), name='input')
+    for i, d in enumerate(dims[1:]):  # 注意最后一层 activation=None
+        y = h = Dense(d, kernel_initializer=init, name=f'encoder_{i}',
+                      activation=None if i == len(dims) - 2 else act)(h)
 
-    for i in range(n_stacks - 1):
-        h = tf.keras.layers.Dense(dims[i + 1], activation=act, kernel_initializer=init, name='encoder_%d' % i)(h)
-    h = tf.keras.layers.Dense(dims[-1], kernel_initializer=init, name='encoder_%d' % (n_stacks - 1))(h)
+    # 解码部分 shape = [20(略), 2000, 500, 500, 48] 从20维的聚类空间 解码到 48维的词向量空间
+    for i, d in reversed(list(enumerate(dims[:-1]))):
+        y = Dense(d, kernel_initializer=init, name=f'decoder_{i}',
+                  activation=None if i == 0 else act)(y)
 
-    y = h
-    for i in range(n_stacks - 1, 0, -1):
-        y = tf.keras.layers.Dense(dims[i], activation=act, kernel_initializer=init, name='decoder_%d' % i)(y)
-
-    y = tf.keras.layers.Dense(dims[0], kernel_initializer=init, name='decoder_0')(y)
-
-    return tf.keras.models.Model(inputs=x, outputs=y, name='AE'), tf.keras.models.Model(inputs=x, outputs=h,
-                                                                                        name='encoder')
+    auto_encoder = Model(inputs=x, outputs=y, name='AE')
+    encoder_part = Model(inputs=x, outputs=h, name='encoder')
+    return auto_encoder, encoder_part
 
 
 class ClusteringLayer(tf.keras.layers.Layer):
@@ -86,16 +84,16 @@ class STC:
 
         self.n_clusters = n_clusters
         self.alpha = alpha
-        self.autoencoder, self.encoder = autoencoder(self.dims, init=init)
+        self.ae, self.encoder = autoencoder(self.dims, init=init)
 
         clustering_layer = ClusteringLayer(self.n_clusters, name='clustering')(self.encoder.output)
-        self.model = tf.keras.models.Model(inputs=self.encoder.input, outputs=clustering_layer)
+        self.model = Model(inputs=self.encoder.input, outputs=clustering_layer)
 
     def pretrain(self, x, epochs=200, batch_size=256, save_dir='results/temp'):
-        self.autoencoder.compile(optimizer='adam', loss='mse')
+        self.ae.compile(optimizer='adam', loss='mse')
         with timing('pretraining', log_fn=logger.info):
-            self.autoencoder.fit(x, x, batch_size=batch_size, epochs=epochs)
-        self.autoencoder.save_weights(save_dir + '/ae_weights.h5')
+            self.ae.fit(x, x, batch_size=batch_size, epochs=epochs)
+        self.ae.save_weights(save_dir + '/ae_weights.h5')
         logger.debug('Pretrained weights are saved to %s/ae_weights.h5', save_dir)
 
     def load_weights(self, weights):
@@ -213,13 +211,10 @@ if __name__ == "__main__":
     dec = STC(dims=[X_trn.shape[1], 500, 500, 2000, 20], n_clusters=np.unique(y_trn).size)
 
     # pretrain AutoEncoder-part
-    # if os.path.exists(args.ae_weights):
-    #     dec.autoencoder.load_weights(args.ae_weights)
-    # else:
-    #     dec.pretrain(X_trn, epochs=args.pretrain_epochs, batch_size=args.batch_size, save_dir=args.save_dir)
-
-    dec.autoencoder.load_weights(args.ae_weights)
-    # dec.pretrain(X_trn, epochs=args.pretrain_epochs, batch_size=args.batch_size, save_dir=args.save_dir)
+    if os.path.exists(args.ae_weights):
+        dec.ae.load_weights(args.ae_weights)
+    else:
+        dec.pretrain(X_trn, epochs=args.pretrain_epochs, batch_size=args.batch_size, save_dir=args.save_dir)
 
     # clustering
     dec.model.summary()
