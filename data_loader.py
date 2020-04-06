@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-import os
 from collections import Counter
 
 import nltk
@@ -10,77 +9,42 @@ from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.preprocessing import MinMaxScaler
 
 
-def load_stackoverflow(data_path='data/stackoverflow/'):
+def load_stackoverflow(data_path='data/stackoverflow', a=0.1):
+    # 1. 获取 word -> vector 的映射
+    # noinspection PyTypeChecker
+    w2i = dict(line.rstrip().split('\t') for line in open(f'{data_path}/vocab_withIdx.dic'))
+    i2w = {v: k for k, v in w2i.items()}
+    w2v = {i2w[i.strip()]: np.fromstring(v, sep=' ')
+           for i, v in zip(open(f'{data_path}/vocab_emb_Word2vec_48_index.dic'),
+                           open(f'{data_path}/vocab_emb_Word2vec_48.vec'))}
 
-    # load SO embedding
-    with open(data_path + 'vocab_withIdx.dic', 'r') as inp_indx, \
-            open(data_path + 'vocab_emb_Word2vec_48_index.dic', 'r') as inp_dic, \
-            open(data_path + 'vocab_emb_Word2vec_48.vec') as inp_vec:
-        pair_dic = inp_indx.readlines()
-        word_index = {}
-        for pair in pair_dic:
-            word, index = pair.replace('\n', '').split('\t')
-            word_index[word] = index
-
-        index_word = {v: k for k, v in word_index.items()}
-
-        del pair_dic
-
-        emb_index = inp_dic.readlines()
-        emb_vec = inp_vec.readlines()
-        word_vectors = {}
-        for index, vec in zip(emb_index, emb_vec):
-            word = index_word[index.replace('\n', '')]
-            word_vectors[word] = np.array(list((map(float, vec.split()))))
-
-        del emb_index
-        del emb_vec
-
-    with open(data_path + 'title_StackOverflow.txt', 'r') as inp_txt:
-        all_lines = inp_txt.readlines()[:-1]
-        text_file = " ".join([" ".join(nltk.word_tokenize(c)) for c in all_lines])
-        word_count = Counter(text_file.split())
-        total_count = sum(word_count.values())
-        unigram = {}
-        for item in word_count.items():
-            unigram[item[0]] = item[1] / total_count
-
-        all_vector_representation = np.zeros(shape=(20000, 48))
-        for i, line in enumerate(all_lines):
-            word_sentence = nltk.word_tokenize(line)
-
-            sent_rep = np.zeros(shape=[48, ])
-            j = 0
-            for word in word_sentence:
-                try:
-                    wv = word_vectors[word]
-                    j = j + 1
-                except KeyError:
+    # 2.a 获取每句的词向量加权表征
+    # nltk.download('punkt')
+    with open(f'{data_path}/title_StackOverflow.txt') as f:
+        lines = [line.strip() for line in f]  # 载入内存，后面复用
+        # 统计每个word的unigram_prob
+        word_counter = Counter(word for line in lines for word in nltk.word_tokenize(line))
+        n_unigrams = sum(word_counter.values())
+        unigram_prob = {w: c / n_unigrams for w, c in word_counter.items()}
+        # 用反向unigram概率 加权求和 得到句子向量
+        X = []
+        for line in lines:
+            vecs, wgts = [], []
+            for w in nltk.word_tokenize(line):
+                if w not in w2v:
                     continue
+                vecs.append(w2v[w])
+                wgts.append(a / (a + unigram_prob[w]))
+            line_vec = np.zeros((48,)) if len(vecs) == 0 else np.average(vecs, weights=wgts, axis=0)
+            X.append(line_vec)
+    X = np.stack(X)
+    # 2.b 减去主特征向量，得到SIF特征
+    major = PCA(n_components=1).fit(X).components_  # 主特征向量 shape: (1, 48)
+    X_SIF = MinMaxScaler().fit_transform(X - X @ major.T * major)  # 各句去掉自己在主方向上的投影
 
-                weight = 0.1 / (0.1 + unigram[word])
-                sent_rep += wv * weight
-            if j != 0:
-                all_vector_representation[i] = sent_rep / j
-            else:
-                all_vector_representation[i] = sent_rep
-
-    pca = PCA(n_components=1)
-    pca.fit(all_vector_representation)
-    pca = pca.components_
-
-    XX1 = all_vector_representation - all_vector_representation.dot(pca.transpose()) * pca
-
-    XX = XX1
-
-    scaler = MinMaxScaler()
-    XX = scaler.fit_transform(XX)
-
-    with open(data_path + 'label_StackOverflow.txt') as label_file:
-        y = np.array(list((map(int, label_file.readlines()))))
-        print(y.dtype)
-
-    return XX, y
+    # 3. 加载各句的cluster_id (已知的标注)
+    y = np.loadtxt(f'{data_path}/label_StackOverflow.txt')
+    return X_SIF, y
 
 
 def load_search_snippet2(data_path='data/SearchSnippets/new/'):
