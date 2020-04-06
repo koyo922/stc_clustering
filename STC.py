@@ -129,21 +129,26 @@ class STC:
         return self.model.predict(x, verbose=0).argmax(1)
 
     @staticmethod
-    def target_distribution(q):
+    def sharpen_distribution(q):
+        """ 对软聚类结果q 进行锐化 """
+        # shape: q [B, 20]
+        # shape: q.sum(0) [20]
+        # broadcast: weight [B, 20]
         weight = q ** 2 / q.sum(0)
+        # shape: weight.T [20, B]
+        # shape: weight.sum(1) [B]
+        # broadcast: weight.T / weight.sum(1) result [20, B]
+        # result: ?.T [B, 20]
         return (weight.T / weight.sum(1)).T
 
-    def compile(self, optimizer='sgd', loss='kld'):
-        self.model.compile(optimizer=optimizer, loss=loss)
-
     def fit(self, x, y=None, max_iter=int(2e4), batch_size=256, tol=1e-3,
-            update_interval=140, save_dir='./results/temp', rand_seed=None):
+            update_interval=140, save_dir='./results/temp'):
         # Step 1: initialize cluster centers using k-means
         logger.info('Initializing cluster centers with k-means.')
         km = KMeans(n_clusters=self.n_clusters, n_init=100)
-        y_pred = km.fit_predict(self.encoder.predict(x))
-        y_pred_last = np.copy(y_pred)  # TODO
-        self.model.get_layer(name='clustering').set_weights([km.cluster_centers_])
+        centroids = km.fit_predict(self.encoder.predict(x))
+        y_pred_last = np.copy(centroids)  # TODO
+        self.model.get_layer(name='clustering').set_weights([km.cluster_centers_])  # 直接用的是簇心位置
 
         loss = 0
         index = 0
@@ -151,15 +156,15 @@ class STC:
         for ite in range(int(max_iter)):
             if ite % update_interval == 0:
                 q = self.model.predict(x, verbose=0)
-                p = self.target_distribution(q)
-                y_pred = q.argmax(1)
-                acc = metrics.acc(y, y_pred)
-                nmi = metrics.nmi(y, y_pred)
+                p = self.sharpen_distribution(q)
+                centroids = q.argmax(1)
+                acc = metrics.acc(y, centroids)
+                nmi = metrics.nmi(y, centroids)
                 logger.info('Iter %d: acc = %.5f, nmi = %.5f, loss = %.5f', ite, acc, nmi, loss)
 
                 # check stop criterion
-                delta_label = np.sum(y_pred != y_pred_last).astype(np.float32) / y_pred.shape[0]
-                y_pred_last = np.copy(y_pred)
+                delta_label = np.sum(centroids != y_pred_last).astype(np.float32) / centroids.shape[0]
+                y_pred_last = np.copy(centroids)
                 if ite > 0 and delta_label < tol:
                     print('delta_label ', delta_label, '< tol ', tol)
                     print('Reached tolerance threshold. Stopping training.')
@@ -171,7 +176,7 @@ class STC:
 
         logger.info('saving model to: %s/STC_model_final.h5', save_dir)
         self.model.save_weights(save_dir + '/STC_model_final.h5')
-        return y_pred
+        return centroids
 
 
 def auto_device(forced_gpus: str = None, n_gpus: int = 1):
@@ -243,5 +248,5 @@ if __name__ == "__main__":
     dec.model.compile(optimizer=SGD(0.1, 0.9), loss='kld')
 
     y_pred = dec.fit(X_trn, y_trn, tol=args.tol, max_iter=args.maxiter, batch_size=args.batch_size,
-                     update_interval=args.update_interval, save_dir=args.save_dir, rand_seed=0)
+                     update_interval=args.update_interval, save_dir=args.save_dir)
     logger.info('acc: %.3f  nmi: %.3f', metrics.acc(y_trn, y_pred), metrics.nmi(y_trn, y_pred))
