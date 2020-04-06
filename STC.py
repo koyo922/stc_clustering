@@ -125,15 +125,8 @@ class STC:
         self.ae.save_weights(save_dir + '/ae_weights.h5')
         logger.debug('Pretrained weights are saved to %s/ae_weights.h5', save_dir)
 
-    def load_weights(self, weights):
-        self.model.load_weights(weights)
-
-    def extract_features(self, x):
-        return self.encoder.predict(x)
-
     def predict(self, x):
-        q = self.model.predict(x, verbose=0)
-        return q.argmax(1)
+        return self.model.predict(x, verbose=0).argmax(1)
 
     @staticmethod
     def target_distribution(q):
@@ -143,7 +136,7 @@ class STC:
     def compile(self, optimizer='sgd', loss='kld'):
         self.model.compile(optimizer=optimizer, loss=loss)
 
-    def fit(self, x, y=None, maxiter=2e4, batch_size=256, tol=1e-3,
+    def fit(self, x, y=None, max_iter=int(2e4), batch_size=256, tol=1e-3,
             update_interval=140, save_dir='./results/temp', rand_seed=None):
         # Step 1: initialize cluster centers using k-means
         logger.info('Initializing cluster centers with k-means.')
@@ -155,7 +148,7 @@ class STC:
         loss = 0
         index = 0
         index_array = np.arange(x.shape[0])
-        for ite in range(int(maxiter)):
+        for ite in range(int(max_iter)):
             if ite % update_interval == 0:
                 q = self.model.predict(x, verbose=0)
                 p = self.target_distribution(q)
@@ -247,7 +240,8 @@ if __name__ == "__main__":
 
     # clustering
     dec.model.summary()
-    dec.compile(optimizer=SGD(0.1, 0.9), loss='kld')
-    y_pred = dec.fit(X_trn, y_trn, tol=args.tol, maxiter=args.maxiter, batch_size=args.batch_size,
+    dec.model.compile(optimizer=SGD(0.1, 0.9), loss='kld')
+
+    y_pred = dec.fit(X_trn, y_trn, tol=args.tol, max_iter=args.maxiter, batch_size=args.batch_size,
                      update_interval=args.update_interval, save_dir=args.save_dir, rand_seed=0)
     logger.info('acc: %.3f  nmi: %.3f', metrics.acc(y_trn, y_pred), metrics.nmi(y_trn, y_pred))
