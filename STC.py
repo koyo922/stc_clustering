@@ -11,8 +11,9 @@ import tensorflow as tf
 from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
 from tensorflow.python.keras.optimizers import SGD
-from tensorflow.python.keras.layers import Input, Dense
+from tensorflow.python.keras.layers import Input, Dense, InputSpec
 from tensorflow.python.keras.models import Model
+from tensorflow.python.keras import backend as K
 
 import metrics
 from data_loader import load_data
@@ -37,33 +38,74 @@ def autoencoder(dims, act=tf.nn.leaky_relu, init='glorot_uniform'):
     return auto_encoder, encoder_part
 
 
+def patch_tf_ops():
+    """
+    为TF Tensor增加一些常用运算符的语法糖; 减少嵌套层数, 写法更直观
+    e.g. K.expand_dims(t, axis=1) --> t.exp_dim(axis=1)
+    """
+    from tensorflow.python.framework import ops
+
+    def _exp_dim(self, **kwargs):
+        return K.expand_dims(self, **kwargs)
+
+    def _sum(self, **kwargs):
+        return K.sum(self, **kwargs)
+
+    def _square(self):
+        return K.square(self)
+
+    def _div(self, other):
+        return self / other
+
+    def _inv(self):
+        return 1 / self
+
+    @property
+    def _T(self):
+        return K.transpose(self)
+
+    ops.Tensor.exp_dim = _exp_dim
+    ops.Tensor.sum = _sum
+    ops.Tensor.square = _square
+    ops.Tensor.div = _div
+    ops.Tensor.inv = _inv
+    ops.Tensor.T = _T
+
+
+patch_tf_ops()
+
+
 class ClusteringLayer(tf.keras.layers.Layer):
-    def __init__(self, n_clusters, weights=None, alpha=1.0, **kwargs):
+    def __init__(self, n_clusters, alpha=1.0, **kwargs):
         if 'input_shape' not in kwargs and 'input_dim' in kwargs:
             kwargs['input_shape'] = (kwargs.pop('input_dim'),)
-        super(ClusteringLayer, self).__init__(**kwargs)
+        super().__init__(**kwargs)  # name
         self.n_clusters = n_clusters
         self.alpha = alpha
-        self.initial_weights = weights
-        self.input_spec = tf.keras.layers.InputSpec(ndim=2)
+        self.input_spec = None
+        self.centroids = None
 
-    def build(self, input_shape):
+    def build(self, input_shape):  # 根据运行时输入数据确定具体的形状
         assert len(input_shape) == 2
         input_dim = input_shape[1].value
-        self.input_spec = tf.keras.layers.InputSpec(dtype=tf.keras.backend.floatx(), shape=(None, input_dim))
-        self.clusters = self.add_weight(shape=(self.n_clusters, input_dim), initializer='glorot_uniform',
-                                        name='clusters')
-        if self.initial_weights is not None:
-            self.set_weights(self.initial_weights)
-            del self.initial_weights
-        self.built = True
+        self.input_spec = InputSpec(dtype=K.floatx(), shape=(None, input_dim))
+        self.centroids = self.add_weight(shape=(self.n_clusters, input_dim),
+                                         initializer='glorot_uniform', name='clusters')
+        super().build(input_shape)  # self.built = True
 
     def call(self, inputs, **kwargs):
-        q = 1.0 / (1.0 + (tf.keras.backend.sum(
-            tf.keras.backend.square(tf.keras.backend.expand_dims(inputs, axis=1) - self.clusters),
-            axis=2) / self.alpha))
-        q **= (self.alpha + 1.0) / 2.0
-        q = tf.keras.backend.transpose(tf.keras.backend.transpose(q) / tf.keras.backend.sum(q, axis=1))
+        # shape: inputs [B, 20] ---(expand)--> [B, 1, 20]
+        # shape: centroids [20, 20]
+        # broadcast: [B, 20, 20]
+        # square error summed over axis=2: [B, 20] 表示 每个样本与每个簇心的L2距离
+        q = 1 / (1 + (inputs.exp_dim(axis=1) - self.centroids).square().sum(axis=2).div(self.alpha))
+        q **= (self.alpha + 1) / 2  # alpha 默认为1，暂不考虑
+
+        # shape: q.T [20, B] 每个簇心与每个样本的L2距离
+        # shape: q.sum(axis=1) [B] 每个样本到所有簇心距离之和
+        # broadcast: [20, B]
+        # shape: (q.T / q.sum()).T [B, 20] 每个样本的软聚类标签
+        q = (q.T / q.sum(axis=1)).T
         return q
 
     def compute_output_shape(self, input_shape):
