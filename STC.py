@@ -10,7 +10,7 @@ import numpy as np
 import tensorflow as tf
 from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
-from tensorflow.python.keras.optimizers import SGD
+from tensorflow.python.keras.optimizers import SGD, Adam
 from tensorflow.python.keras.layers import Input, Dense, InputSpec, Layer
 from tensorflow.python.keras.models import Model
 from tensorflow.python.keras import backend as K
@@ -141,40 +141,33 @@ class STC:
         # result: ?.T [B, 20]
         return (weight.T / weight.sum(1)).T
 
-    def fit(self, x, y=None, max_iter=int(2e4), batch_size=256, tol=1e-3,
-            update_interval=140, save_dir='./results/temp'):
+    def fit(self, x, y=None, max_iter=3, batch_size=256, tol=1e-3, save_dir='./results/temp'):
         # Step 1: initialize cluster centers using k-means
         logger.info('Initializing cluster centers with k-means.')
-        km = KMeans(n_clusters=self.n_clusters, n_init=100)
+        km = KMeans(n_clusters=self.n_clusters, n_init=100, n_jobs=7)  # 记得开多进程
         centroids = km.fit_predict(self.encoder.predict(x))  # 聚类id不直接使用，仅用作收敛判断条件
         self.model.get_layer(name='clustering').set_weights([km.cluster_centers_])  # 直接用的是簇心位置
 
-        loss = 0
-        index = 0
-        last_centroids = centroids  # TODO
-        index_array = np.arange(x.shape[0])
+        last_centroids = centroids
         for i in range(max_iter):
-            if i % update_interval == 0:  # 注意不能直接反写continue; 因为下面还有逻辑
-                q = self.model.predict(x, verbose=0)  # 软聚类结果
-                p = self.sharpen_distribution(q)  # 轻度锐化(差距拉得更开)结果
-                centroids = q.argmax(1)  # 重度锐化(硬聚类)结果
+            q = self.model.predict(x, verbose=0)  # 软聚类结果
+            p = self.sharpen_distribution(q)  # 轻度锐化(差距拉得更开)结果
+            centroids = q.argmax(1)  # 重度锐化(硬聚类)结果
 
-                # 如果事先有人工标注的类别信息，可以用来打印精度；但是不参与模型训练
-                if y is not None:
-                    acc = metrics.acc(y, centroids)
-                    nmi = metrics.nmi(y, centroids)
-                    logger.info('Iter %d: acc = %.5f, nmi = %.5f, loss = %.5f', i, acc, nmi, loss)
+            # 如果硬聚类结果变动很小，就判定为收敛了，终止训练
+            diff_centroids_frac = np.mean(centroids != last_centroids)
+            if i > 0 and diff_centroids_frac < tol:
+                logger.info('diff_centroids_frac(%.3f) < tol(%.3f), stop training', diff_centroids_frac, tol)
+                break
+            last_centroids = centroids
 
-                # 如果硬聚类结果变动很小，就判定为收敛了，终止训练
-                diff_centroids_frac = np.mean(centroids != last_centroids)
-                if i > 0 and diff_centroids_frac < tol:
-                    logger.info('diff_centroids_frac(%.3f) < tol(%.3f), stop training', diff_centroids_frac, tol)
-                    break
-                last_centroids = centroids
-
-            idx = index_array[index * batch_size: min((index + 1) * batch_size, x.shape[0])]
-            loss = self.model.train_on_batch(x=x[idx], y=p[idx])
-            index = index + 1 if (index + 1) * batch_size <= x.shape[0] else 0
+            # 否则继续训练
+            loss = self.model.fit(x, p, batch_size=batch_size).history['loss'][0]
+            # 如果事先有人工标注的类别信息，可以用来打印精度；但是不参与模型训练
+            if y is not None:
+                acc = metrics.acc(y, centroids)
+                nmi = metrics.nmi(y, centroids)
+                logger.info('Iter %d: acc = %.5f, nmi = %.5f, loss = %.5f', i, acc, nmi, loss)
 
         logger.info('saving model to: %s/STC_model_final.h5', save_dir)
         self.model.save_weights(save_dir + '/STC_model_final.h5')
@@ -200,17 +193,11 @@ def auto_device(forced_gpus: str = None, n_gpus: int = 1):
 
 
 def get_args():
-    # args
     import argparse
     parser = argparse.ArgumentParser(description='train',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--dataset', default='stackoverflow',
                         choices=['stackoverflow', 'biomedical', 'search_snippets'])
-    parser.add_argument('--batch_size', default=64, type=int)
-    parser.add_argument('--maxiter', default=1000, type=int)
-    parser.add_argument('--pretrain_epochs', default=15, type=int)
-    parser.add_argument('--update_interval', default=30, type=int)
-    parser.add_argument('--tol', default=0.0001, type=float)
     parser.add_argument('--ae_weights', default='/data/search_snippets/results/ae_weights.h5')
     parser.add_argument('--save_dir', default='/data/search_snippets/results')
     return parser.parse_args()
@@ -220,34 +207,22 @@ if __name__ == "__main__":
     auto_device(n_gpus=1)  # 只用一块显卡
     args = get_args()
     os.makedirs(args.save_dir, exist_ok=True)
-    if args.dataset == 'search_snippets':
-        args.update_interval = 100
-        args.maxiter = 100
-    elif args.dataset == 'stackoverflow':
-        args.update_interval = 500
-        args.maxiter = 1500
-        args.pretrain_epochs = 12
-    elif args.dataset == 'biomedical':
-        args.update_interval = 300
-    else:
-        raise Exception("Dataset not found!")
-
     # load dataset
     X_trn, X_tst, y_trn, y_tst = train_test_split(*load_data(args.dataset),
                                                   test_size=0.1, random_state=0, shuffle=True)
 
     # create model
-    dec = STC(dims=[X_trn.shape[1], 500, 500, 2000, 20], n_clusters=np.unique(y_trn).size)
+    stc = STC(dims=[X_trn.shape[1], 500, 500, 2000, 20], n_clusters=np.unique(y_trn).size)
 
     # pretrain AutoEncoder-part
     if os.path.exists(args.ae_weights):
-        dec.ae.load_weights(args.ae_weights)
+        stc.ae.load_weights(args.ae_weights)
     else:
-        dec.pretrain(X_trn, epochs=args.pretrain_epochs, batch_size=args.batch_size, save_dir=args.save_dir)
+        stc.pretrain(X_trn, epochs=15, batch_size=64, save_dir=args.save_dir)
 
     # clustering
-    dec.model.summary()
-    dec.model.compile(optimizer=SGD(0.1, 0.9), loss='kld')
-    y_pred = dec.fit(X_trn, y_trn, tol=args.tol, max_iter=args.maxiter, batch_size=args.batch_size,
-                     update_interval=args.update_interval, save_dir=args.save_dir)
+    stc.model.summary()
+    # dec.model.compile(optimizer=SGD(lr=0.1, momentum=0.9), loss='kld')
+    stc.model.compile(optimizer=Adam(), loss='kld')  # 换adam可以再提高1个点, acc: 0.61, nmi: 0.56
+    y_pred = stc.fit(X_trn, y_trn, max_iter=10, batch_size=64, save_dir=args.save_dir)
     logger.info('acc: %.3f  nmi: %.3f', metrics.acc(y_trn, y_pred), metrics.nmi(y_trn, y_pred))
