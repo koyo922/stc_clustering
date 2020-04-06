@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 
+
 import os
 import subprocess
+import warnings
+
+warnings.filterwarnings(action='ignore', category=FutureWarning)
 
 from rc_utils.misc.log_writer import init_log
 from rc_utils.misc.time import timing
@@ -141,13 +145,14 @@ class STC:
         # result: ?.T [B, 20]
         return (weight.T / weight.sum(1)).T
 
-    def fit(self, x, y=None, max_iter=3, batch_size=256, tol=1e-3, save_dir='./results/temp'):
+    def fit_predict(self, x, y=None, max_iter=10, batch_size=256, tol=1e-3, save_dir='./results/temp'):
         # Step 1: initialize cluster centers using k-means
         logger.info('Initializing cluster centers with k-means.')
         km = KMeans(n_clusters=self.n_clusters, n_init=100, n_jobs=7)  # 记得开多进程
         centroids = km.fit_predict(self.encoder.predict(x))  # 聚类id不直接使用，仅用作收敛判断条件
         self.model.get_layer(name='clustering').set_weights([km.cluster_centers_])  # 直接用的是簇心位置
 
+        # Step 2: loop: [clustering, sharpening, fit] till convergence
         last_centroids = centroids
         for i in range(max_iter):
             q = self.model.predict(x, verbose=0)  # 软聚类结果
@@ -159,20 +164,20 @@ class STC:
             if i > 0 and diff_centroids_frac < tol:
                 logger.info('diff_centroids_frac(%.3f) < tol(%.3f), stop training', diff_centroids_frac, tol)
                 break
-            last_centroids = centroids
+            else:  # 否则继续训练
+                last_centroids = centroids
 
-            # 否则继续训练
-            loss = self.model.fit(x, p, batch_size=batch_size).history['loss'][0]
             # 如果事先有人工标注的类别信息，可以用来打印精度；但是不参与模型训练
             if y is not None:
                 acc = metrics.acc(y, centroids)
                 nmi = metrics.nmi(y, centroids)
-                logger.info('Iter %d: acc = %.5f, nmi = %.5f, loss = %.5f', i, acc, nmi, loss)
+                loss = self.model.fit(x, p, batch_size=batch_size).history['loss'][0]
+                logger.info('Iter %d: acc = %.3f, nmi = %.3f, diff_frac=%.3f, loss = %.3f',
+                            i, acc, nmi, diff_centroids_frac, loss)
 
         logger.info('saving model to: %s/STC_model_final.h5', save_dir)
         self.model.save_weights(save_dir + '/STC_model_final.h5')
         return centroids
-
 
 def auto_device(forced_gpus: str = None, n_gpus: int = 1):
     """ cuda不可用时，返回'cpu'; 否则，返回最空闲的那一张显卡，例如 'cuda:3' """
@@ -223,6 +228,10 @@ if __name__ == "__main__":
     # clustering
     stc.model.summary()
     # dec.model.compile(optimizer=SGD(lr=0.1, momentum=0.9), loss='kld')
-    stc.model.compile(optimizer=Adam(), loss='kld')  # 换adam可以再提高1个点, acc: 0.61, nmi: 0.56
-    y_pred = stc.fit(X_trn, y_trn, max_iter=10, batch_size=64, save_dir=args.save_dir)
-    logger.info('acc: %.3f  nmi: %.3f', metrics.acc(y_trn, y_pred), metrics.nmi(y_trn, y_pred))
+    stc.model.compile(optimizer=Adam(lr=0.001), loss='kld')  # 换adam可以再提高1个点, acc: 0.60, nmi: 0.59
+
+    y_pred = stc.fit_predict(X_trn, y_trn, batch_size=128, save_dir=args.save_dir)  # batch_size太大会过早收敛
+    logger.info('@train_set acc: %.3f  nmi: %.3f', metrics.acc(y_trn, y_pred), metrics.nmi(y_trn, y_pred))
+
+    y_pred = stc.predict(X_tst)
+    logger.info('@test_set acc: %.3f  nmi: %.3f', metrics.acc(y_tst, y_pred), metrics.nmi(y_tst, y_pred))
